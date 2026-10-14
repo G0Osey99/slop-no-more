@@ -1,0 +1,12 @@
+{
+  "name": "slop-no-more",
+  "owner": { "name": "G0Osey99" },
+  "plugins": [
+    {
+      "name": "slop-no-more",
+      "source": "./",
+      "description": "Rewrite or review human-facing writing so it reads as written by a specific person for a specific reader, without changing what it says.",
+      "version": "1.7.1"
+    }
+  ]
+}

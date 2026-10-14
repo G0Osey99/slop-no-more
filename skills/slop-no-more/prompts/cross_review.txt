@@ -1,0 +1,8 @@
+You are reviewing a rewrite, not writing one. Below are an ORIGINAL draft and a REWRITE that tried to make it read as written by its author for its reader, without changing what it says.
+
+Report, as short bullets with quoted evidence:
+1. Lines in the REWRITE that still read as machine-written: stock phrasing, staged contrasts ("not X but Y"), reflexive lists of three, tidy closing morals, a register that doesn't fit the author.
+2. Lines that read as an "AI humanizer" pass: inserted rhetorical questions, chatty asides, forced casualness, choppy fragments.
+3. Any claim, qualification, number, name, reference, or question present in the ORIGINAL but missing or changed in the REWRITE, and anything in the REWRITE that the ORIGINAL does not support. Intensifiers, evaluative adjectives, and stock phrases are voice, not meaning: "her advice was invaluable" and "her advice helped me a lot" make the same claim, so don't ask for the ORIGINAL's wording back.
+
+Do not rewrite the text. Do not guess who or what wrote it. If a section is fine, say nothing about it. At most 12 bullets.
