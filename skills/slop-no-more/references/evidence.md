@@ -98,6 +98,11 @@ Reports: `benchmark/HELDOUT2.md` and `benchmark/REPLICATES.md`.
   - Round 3 was a single run with no comparison arm, and seven of its ten AI drafts are emails or fiction.
   - v1.7.0 was not rerun.
 
+## 1g. Compression ratio tested and rejected; scanner hygiene added (v1.7.2, 2026-11-22)
+- **Compression ("ZipPy"-style) does not separate.** On the calibration v2 corpus (`benchmark/calibration_v2/compression_test.py`, output in `results/compression_auc.txt`), held-out AUC for AI text being more compressible was 0.46 for plain zlib, 0.55 for lzma, and 0.56 for ZipPy-style zlib primed with tune-split AI text, against 0.92 for the index. In academic and fiction writing it points the wrong way (zlib 0.30 and 0.34): current models' prose compresses *less* well than student papers and Reddit stories. The ratio also tracks length (r = -0.59 with text length). It is not part of the scanner.
+- **Invisible characters** (zero-width spaces and joiners, byte-order marks, soft hyphens, bidi controls) are counted as `[info]` and stripped before measuring, so "re\u200bviewed" counts as one word. Joiners inside emoji and non-Latin scripts are legitimate and not counted. They usually come from copying out of web pages, PDFs and chat apps, and this check never scores.
+- **`diff --protect`** adds the user's own terms to the meaning lock. **VERBATIM** lists runs of 8+ words the rewrite kept from the original, with quotations excluded. Eight is the shortest run a word-level winnowing fingerprint (k = 5, w = 4) is guaranteed to catch. It complements RETAINED, which counts sentences with 70%+ bigram overlap and can miss a long run inside a reshaped sentence.
+
 ## 2. StoryScope (fiction; Russell et al., 2026, arXiv:2604.03136)
 Recomputed from the released feature file (61,575 stories; human vs pooled AI; every row points the same way for all five models):
 

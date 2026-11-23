@@ -8,7 +8,11 @@ measured patterns sit inside the range seen in human writing, nothing more.
 
 Usage:
   slopscan.py scan FILE [--genre auto|academic|professional|general|casual|reflection|fiction] [--json] [--top N]
-  slopscan.py diff ORIGINAL REWRITE [--genre ...] [--json]
+  slopscan.py diff ORIGINAL REWRITE [--genre ...] [--protect "term, term" | --protect terms.txt] [--json]
+  scan and diff also take hard limits (checked on the scanned text / the rewrite):
+      --words 375 | --words 300-375   --pages 2-3   --sentences 3
+  and apply preferences.md (this skill's folder, then ~/.claude/slop-no-more/preferences.md):
+      --prefs FILE adds one more file on top; --no-prefs ignores the defaults
   slopscan.py outline FILE          # first and last sentence of every paragraph (outline test, endings)
 
 Genre aliases: essay = general, email = professional, post = casual. Each genre has its own human
@@ -23,6 +27,7 @@ import os
 import re
 import statistics
 import sys
+import unicodedata
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,8 +100,54 @@ def load_lex():
 
 # ---------------------------------------------------------------- text utils
 
+# Invisible or look-alike characters that ride along in pasted text (web pages, PDFs, chat apps, Word).
+# They break word matching here and in other tools; nothing shows they are AI watermarks.
+INVISIBLE = {
+    "\u200b": "ZERO WIDTH SPACE", "\u200c": "ZERO WIDTH NON-JOINER", "\u200d": "ZERO WIDTH JOINER",
+    "\u2060": "WORD JOINER", "\ufeff": "BYTE ORDER MARK", "\u00ad": "SOFT HYPHEN", "\u180e": "MONGOLIAN VOWEL SEPARATOR",
+    "\u202a": "LEFT-TO-RIGHT EMBEDDING", "\u202b": "RIGHT-TO-LEFT EMBEDDING", "\u202c": "POP DIRECTIONAL FORMATTING",
+    "\u202d": "LEFT-TO-RIGHT OVERRIDE", "\u202e": "RIGHT-TO-LEFT OVERRIDE", "\u2066": "LEFT-TO-RIGHT ISOLATE",
+    "\u2067": "RIGHT-TO-LEFT ISOLATE", "\u2068": "FIRST STRONG ISOLATE", "\u2069": "POP DIRECTIONAL ISOLATE",
+    "\u200e": "LEFT-TO-RIGHT MARK", "\u200f": "RIGHT-TO-LEFT MARK",
+}
+ODD_SPACES = {"\u00a0": "NO-BREAK SPACE", "\u202f": "NARROW NO-BREAK SPACE", "\u2007": "FIGURE SPACE",
+              "\u2009": "THIN SPACE", "\u200a": "HAIR SPACE", "\u3000": "IDEOGRAPHIC SPACE"}
+
+
+def invisible_chars(text):
+    """Counter of invisible characters by name. Joiners between non-Latin letters (Persian, Indic scripts)
+    or inside emoji sequences, and bidi marks next to right-to-left letters, are legitimate and not counted."""
+    c = Counter()
+    for i, ch in enumerate(text):
+        if ch not in INVISIBLE:
+            continue
+        prev = text[i - 1] if i else ""
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if ch in "\u200c\u200d" and any(_joinable(x) for x in (prev, nxt)):
+            continue
+        if ch in "\u200e\u200f\u2066\u2067\u2068\u2069" and any(0x0590 <= ord(x or " ") <= 0x08ff for x in (prev, nxt)):
+            continue
+        c[INVISIBLE[ch]] += 1
+    return c
+
+
+def _joinable(ch):
+    """A neighbour that makes a joiner legitimate: a letter outside Latin/Greek/Cyrillic/Armenian, an emoji or
+    symbol, a variation selector, or a skin-tone modifier."""
+    if not ch:
+        return False
+    cat = unicodedata.category(ch)
+    return (cat.startswith("L") and ord(ch) > 0x058f) or cat in ("So", "Sk", "Mn") or 0xfe00 <= ord(ch) <= 0xfe0f
+
+
+def odd_spaces(text):
+    return Counter(ODD_SPACES[ch] for ch in text if ch in ODD_SPACES)
+
+
 def normalize(text):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(ch for ch in text if ch not in INVISIBLE)
+    text = "".join(" " if ch in ODD_SPACES else ch for ch in text)
     text = text.replace("’", "'").replace("‘", "'")
     text = text.replace("“", '"').replace("”", '"')
     return text
@@ -353,8 +404,10 @@ def guess_genre(text, low):
     return "general"
 
 
-def scan(text, genre="auto", top=8, bands=None):
+def scan(text, genre="auto", top=8, bands=None, prefs=None, limits=None):
+    raw = text
     lex = load_lex()
+    inv, oddsp = invisible_chars(text), odd_spaces(text)
     text = normalize(text)
     prose = strip_markup(text)
     low = re.sub(r"\s+", " ", prose.lower())
@@ -389,6 +442,12 @@ def scan(text, genre="auto", top=8, bands=None):
                 weight = 0.0
             F[key] = dict(layer=layer, count=count, weight=weight, examples=(examples or [])[:top], note=note)
 
+    # --- hygiene: never scored (not part of the calibrated index)
+    if inv:
+        F["invisible_characters"] = dict(layer="format", count=sum(inv.values()), weight=0.0,
+                                         examples=[f"{n} x{c}" for n, c in inv.most_common()],
+                                         note="Hidden characters from copying and pasting. Remove them before submitting: they break search, "
+                                              "word counts and some submission systems. Nothing shows they are AI watermarks.")
     # --- residue & stock phrases & vocabulary
     res = find_phrases(low, lex["residue"])
     add("chatbot_residue", "surface", sum(n for _, n in res), 6.0, [p for p, _ in res], "Chat wrapper text left in the piece. Delete.")
@@ -661,6 +720,7 @@ def scan(text, genre="auto", top=8, bands=None):
                 dashes_per_1k=round(nd * k, 1),
                 triads=t3, other_lists=tother,
                 rhythm=rhythm, paragraphs=pstats,
+                odd_spaces=dict(oddsp),
                 # the measures the human bands describe (data/human_bands.json)
                 profile=dict(sent_max=max(slen) if slen else None,
                              long35=round(sum(x >= 35 for x in slen) / len(slen), 3) if slen else None,
@@ -681,7 +741,153 @@ def scan(text, genre="auto", top=8, bands=None):
         else:
             score += f["weight"] * min(f["count"] * k, 12.0)
     label = next(lbl for lim, lbl in BANDS if score < lim)
-    return dict(index=round(score, 2), band=label, info=info, findings=F)
+    banned = set(prefs.get("ban", ())) if prefs else set()
+    if banned & {"semicolon", "dash", "parenthesis"} and "narrow_punctuation" in F:
+        F["narrow_punctuation"]["note"] = f"Expected: your preferences ban {', '.join(sorted(banned))}. Ignore."
+    if "dash" in banned and "dash_density" in F:
+        F["dash_density"]["note"] = "Your preferences ban dashes: remove them all (see PREFS)."
+    return dict(index=round(score, 2), band=label, info=info, findings=F,
+                prefs=dict(sources=prefs.get("sources", []), ban=sorted(prefs.get("ban", ())),
+                           violations=check_prefs(raw, prefs)) if prefs else None,
+                limits=check_limits(raw, limits, prefs))
+
+
+
+# ---------------------------------------------------------------- preferences and hard limits
+
+PREF_PATHS = [os.path.join(HERE, "..", "preferences.md"),
+              os.path.join(os.path.expanduser("~"), ".claude", "slop-no-more", "preferences.md")]
+BANNABLE = ("semicolon", "dash", "colon", "parenthesis", "exclamation")
+WORDS_PER_PAGE = 275  # 12 pt Times New Roman, double-spaced, 1-inch margins (MLA/APA student papers)
+
+
+def load_prefs(paths=None):
+    """Front matter of each preferences file that exists, later files overriding earlier ones.
+    Keys: ban (comma list from BANNABLE), max_sentence_words, words_per_page. The text below the front matter
+    is guidance for the writer and is not read here."""
+    prefs = dict(ban=set(), max_sentence_words=None, words_per_page=WORDS_PER_PAGE, sources=[])
+    for path in PREF_PATHS if paths is None else paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.match(r"\s*---\n(.*?)\n---", text, re.S)
+        if not m:
+            continue
+        found = False
+        for line in m.group(1).split("\n"):
+            line = line.split("#", 1)[0]
+            if ":" not in line:
+                continue
+            key, val = (x.strip() for x in line.split(":", 1))
+            if not val:
+                continue
+            found = True
+            if key == "ban":
+                bad = [b.strip().lower() for b in val.split(",") if b.strip()]
+                prefs["ban"] = {k for b in bad for k in BANNABLE if b.startswith(k[:5])}
+            elif key in ("max_sentence_words", "words_per_page") and val.isdigit():
+                prefs[key] = int(val)
+        if found:
+            prefs["sources"].append(os.path.normpath(path))
+    return prefs
+
+
+def _mask_allowed(text):
+    """Blank out spans where banned punctuation is legitimate: quotations, block quotes, citations in
+    parentheses, URLs and code, number ranges (1-3, 4:6-11), times and verse references (John 3:16)."""
+    def blank(m):
+        return " " * len(m.group(0))
+    t = re.sub(r'"[^"\n]{1,800}"', blank, text)
+    t = re.sub(r"(?m)^\s*>.*$", blank, t)
+    t = re.sub(r"https?://\S+|`[^`]+`", blank, t)
+    t = re.sub(r"\([^()\n]*\d[^()\n]*\)", blank, t)            # (Smith 4; Jones 7), (2019)
+    t = re.sub(r"\d\s*[-\u2013]\s*\d", blank, t)              # ranges
+    t = re.sub(r"\d:\d", blank, t)                             # 3:16, 10:30
+    return t
+
+
+BAN_PATTERNS = {
+    "semicolon": r";",
+    "dash": r"\u2014|\u2013|(?<=\w) -{1,2} (?=\w)|(?<=\w)--(?=\w)",
+    "colon": r"(?<!^)(?<=[A-Za-z\)\]'\"]):(?=\s)",
+    "parenthesis": r"\(",
+    "exclamation": r"!",
+}
+
+
+def check_prefs(text, prefs):
+    """Banned punctuation in running text (headings and labels like "Key Scripture:" included only for
+    semicolons and dashes; colons after a heading-style label at line start are allowed), and sentences
+    over max_sentence_words. Returns {rule: dict(count, examples)}."""
+    out = {}
+    if not prefs:
+        return out
+    t = normalize(text)
+    masked = _mask_allowed(t)
+    for rule in sorted(prefs.get("ban", ())):
+        pat = re.compile(BAN_PATTERNS[rule], re.M)
+        hits = list(pat.finditer(masked))
+        if rule == "colon":  # a short label at line start ("Statement: ...") is a format convention
+            def is_label(h):
+                head = t[t.rfind("\n", 0, h.start()) + 1:h.start()].strip(" *#-")
+                ws = head.split()
+                return 0 < len(ws) <= 6 and not re.search(r"[.!?]", head) and (len(ws) <= 2 or all(w[:1].isupper() for w in ws))
+            hits = [h for h in hits if not is_label(h)]
+        if hits:
+            ex = []
+            for h in hits[:6]:
+                a, b = max(0, h.start() - 50), min(len(t), h.end() + 40)
+                ex.append(("..." if a else "") + t[a:b].replace("\n", " ").strip() + ("..." if b < len(t) else ""))
+            out[rule] = dict(count=len(hits), examples=ex)
+    cap = prefs.get("max_sentence_words")
+    if cap:
+        longs = [x for p in prose_paragraphs(strip_markup(t)) for x in sentences(p) if len(words_of(x)) > cap]
+        if longs:
+            out["max_sentence_words"] = dict(count=len(longs), examples=[f"[{len(words_of(x))}] {snippet(x, 100)}" for x in longs[:6]])
+    return out
+
+
+def parse_range(spec):
+    """'375' -> (None, 375); '300-375' -> (300, 375); '2-3' -> (2, 3). Floats allowed for pages."""
+    if spec is None:
+        return None
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:[-\u2013]|to)\s*(\d+(?:\.\d+)?)\s*", str(spec))
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", str(spec))
+    if m:
+        return (None, float(m.group(1)))
+    raise ValueError(f"not a number or range: {spec!r}")
+
+
+def count_words(text):
+    """Word count the way Word counts it: whitespace-separated tokens, Markdown markers dropped."""
+    t = re.sub(r"(?m)^\s*(?:#+|[-*\u2022]|>)\s+", "", normalize(text))
+    t = re.sub(r"\*\*|__|`", "", t)
+    return len([w for w in t.split() if re.search(r"\w", w)])
+
+
+def check_limits(text, limits, prefs=None):
+    """limits: dict with any of words, pages, sentences -> (min|None, max). Pages are an estimate."""
+    if not limits:
+        return None
+    wpp = (prefs or {}).get("words_per_page") or WORDS_PER_PAGE
+    nw = count_words(text)
+    t = normalize(text)
+    ns = sum(len(sentences(p)) for p in paragraphs(t) if not is_heading(p))
+    vals = dict(words=nw, sentences=ns, pages=round(nw / wpp, 2))
+    rows = []
+    for key in ("words", "pages", "sentences"):
+        if key not in limits or limits[key] is None:
+            continue
+        lo, hi = limits[key]
+        v = vals[key]
+        status = "OVER" if v > hi else "UNDER" if lo is not None and v < lo else "ok"
+        rows.append(dict(limit=key, value=v, min=lo, max=hi, status=status,
+                         over_by_words=round(nw - hi * (wpp if key == "pages" else 1)) if status == "OVER" and key != "sentences" else None))
+    return dict(words=nw, sentences=ns, pages_est=vals["pages"], words_per_page=wpp, checks=rows)
 
 
 # ---------------------------------------------------------------- diff (meaning lock)
@@ -742,9 +948,53 @@ def _present(item, text):
     return re.sub(r"\s+", " ", val) in re.sub(r"\s+", " ", text)
 
 
-def diff(orig, new, genre="auto"):
+RUN_MIN = 8  # word runs this long carried over verbatim are listed (a k=5, w=4 winnowing fingerprint is guaranteed at 8)
+
+
+def verbatim_runs(orig, new, n=RUN_MIN):
+    """Runs of n+ consecutive words in the rewrite that also occur in the original, longest first.
+    Quoted passages and block quotes are skipped: they are supposed to stay word for word."""
+    def toks(t):
+        t = normalize(t)
+        t = re.sub(r'"[^"\n]{3,600}"', " \u2016 ", t)       # quotes become a barrier token
+        t = re.sub(r"(?m)^\s*>.*$", " \u2016 ", t)            # block quotes
+        out = []
+        for m in re.finditer(r"\u2016|[A-Za-z0-9\u00c0-\u024f]+(?:['\u2019-][A-Za-z0-9]+)*", t):
+            out.append(None if m.group(0) == "\u2016" else m.group(0))
+        return out
+    a, b = toks(orig), toks(new)
+    grams = {tuple(w.lower() for w in a[i:i + n]) for i in range(len(a) - n + 1) if None not in a[i:i + n]}
+    hit = [i for i in range(len(b) - n + 1) if None not in b[i:i + n] and tuple(w.lower() for w in b[i:i + n]) in grams]
+    runs, start, last = [], None, None
+    for i in hit + [None]:
+        if start is not None and (i is None or i != last + 1):
+            runs.append(" ".join(b[start:last + n]))
+            start = None
+        if i is not None and start is None:
+            start = i
+        last = i
+    return sorted(runs, key=lambda r: -len(r.split()))
+
+
+def parse_terms(spec):
+    """'a, b; c' or a path to a file with one term per line (or comma-separated)."""
+    if not spec:
+        return []
+    if os.path.isfile(spec):
+        spec = read(spec)
+    return [t.strip() for t in re.split(r"[,;\n]", spec) if t.strip()]
+
+
+def diff(orig, new, genre="auto", protect=None, prefs=None, limits=None):
     to, tn = normalize(orig), normalize(new)
     missing = sorted(f"{k}:{v}" for k, v in lock_items(orig) if not _present((k, v), tn))
+    prot = []
+    for term in protect or []:
+        term_n = normalize(term)
+        pat = re.compile(r"(?<!\w)" + re.escape(term_n) + r"(?!\w)")
+        c0, c1 = len(pat.findall(to)), len(pat.findall(tn))
+        prot.append(dict(term=term_n, before=c0, after=c1))
+    missing += [f"protected:{p['term']}" for p in prot if p["before"] and not p["after"]]
     added = sorted(f"{k}:{v}" for k, v in lock_items(new) if not _present((k, v), to))
     wa, wb = words_of(normalize(orig)), words_of(normalize(new))
     ca = {w.lower() for w in wa if w.lower() not in FUNCTION_WORDS}
@@ -771,8 +1021,16 @@ def diff(orig, new, genre="auto"):
         if b0 and any(len(b0 & b1) / len(b0) >= 0.7 for b1 in s_new):
             kept += 1
     retained = dict(kept=kept, total=len(s_orig))
+    runs = verbatim_runs(orig, new)
     return dict(
         retained=retained,
+        verbatim_runs=dict(min_words=RUN_MIN, count=len(runs), words=sum(len(r.split()) for r in runs), runs=runs),
+        protected=prot,
+        invisible_before=dict(invisible_chars(orig)), invisible_after=dict(invisible_chars(new)),
+        prefs=dict(sources=prefs.get("sources", []), ban=sorted(prefs.get("ban", ())),
+                   before={k: v["count"] for k, v in check_prefs(orig, prefs).items()},
+                   violations=check_prefs(new, prefs)) if prefs else None,
+        limits=check_limits(new, limits, prefs),
         structure=dict(before=sh0, after=sh1),
         length=dict(before=len(wa), after=len(wb), change_pct=round(100.0 * (len(wb) - len(wa)) / max(1, len(wa)), 1)),
         content_word_overlap=round(len(ca & cb) / max(1, len(ca | cb)), 2),
@@ -787,6 +1045,25 @@ def diff(orig, new, genre="auto"):
 
 # ---------------------------------------------------------------- output
 
+def print_prefs_limits(pr, lim, label="TEXT"):
+    if pr is not None:
+        src = ", ".join(pr["sources"]) or "none found"
+        print(f"PREFS   from {src}" + (f"   ban: {', '.join(pr['ban'])}" if pr["ban"] else ""))
+        for rule, v in pr["violations"].items():
+            print(f"  ! {label} breaks preference '{rule}' x{v['count']}" + (" (fix before returning)" if label == "REWRITE" else ""))
+            for ex in v["examples"]:
+                print(f"      - {ex}")
+        if pr["sources"] and not pr["violations"]:
+            print(f"  {label.lower()} follows every preference")
+    if lim:
+        print(f"LIMITS  {lim['words']} words, {lim['sentences']} sentences, about {lim['pages_est']} pages"
+              f" (at {lim['words_per_page']} words/page: 12 pt, double-spaced; confirm in Word)")
+        for c in lim["checks"]:
+            rng = (f"{c['min']:g}-" if c["min"] is not None else "max ") + f"{c['max']:g}"
+            extra = f", cut about {c['over_by_words']} words" if c.get("over_by_words") else ""
+            print(f"  {'!' if c['status'] != 'ok' else ' '} {c['limit']:9s} {c['value']:g} vs {rng}: {c['status']}{extra}")
+
+
 def print_scan(r):
     i = r["info"]
     print(f"SLOPSCAN  index {r['index']}  ({r['band']})   words {i['words']}  genre {i['genre']}")
@@ -794,6 +1071,7 @@ def print_scan(r):
     if rh:
         print(f"  rhythm: {rh['sentences']} sentences, mean {rh['mean']} words, CV {rh['cv']}, short<=8 {rh['short_share']:.0%}, long>=30 {rh['long_share']:.0%}, in flat runs {rh['flat_run_share']:.0%}")
     print(f"  per 1k words: contractions {i['contractions_per_1k']}, dashes {i['dashes_per_1k']}; nominalizations/100w {i['nominalizations_per_100']}; lists of three {i['triads']} vs other {i['other_lists']}")
+    print_prefs_limits(r.get("prefs"), r.get("limits"))
     if not r["findings"]:
         print("  no findings")
         return
@@ -806,6 +1084,7 @@ def print_scan(r):
 
 
 def print_diff(d):
+    print_prefs_limits(d.get("prefs"), d.get("limits"), "REWRITE")
     L = d["length"]
     print(f"LENGTH  {L['before']} -> {L['after']} words ({L['change_pct']:+}%)   content-word overlap {d['content_word_overlap']}")
     print(f"INDEX   {d['index']['before']} ({d['index']['band_before']}) -> {d['index']['after']} ({d['index']['band_after']})")
@@ -815,6 +1094,16 @@ def print_diff(d):
     rt = d["retained"]
     if rt["total"]:
         print(f"RETAINED {rt['kept']}/{rt['total']} prose sentences kept near-verbatim ({100 * rt['kept'] // rt['total']}%)")
+    vr = d["verbatim_runs"]
+    if vr["count"]:
+        print(f"VERBATIM {vr['count']} run{'s' if vr['count'] != 1 else ''} of {vr['min_words']}+ words carried over from the original ({vr['words']} words; quotes excluded)")
+        for r in vr["runs"][:8]:
+            print(f"    = {snippet(r, 140)}  [{len(r.split())}]")
+        if vr["count"] > 8:
+            print(f"    ... {vr['count'] - 8} more (--json for all)")
+    ib, ia = d["invisible_before"], d["invisible_after"]
+    if ib or ia:
+        print(f"INVISIBLE characters {sum(ib.values())} -> {sum(ia.values())}" + (f"  (still present: {', '.join(f'{k} x{v}' for k, v in ia.items())})" if ia else ""))
     print("MEANING LOCK")
     if d["missing_locked"]:
         print("  MISSING from rewrite (verify nothing was lost):")
@@ -822,6 +1111,11 @@ def print_diff(d):
             print("    - " + x)
     else:
         print("  all locked items from the original are present")
+    for p in d["protected"]:
+        if not p["before"]:
+            print(f"  protected term not found in the original: {p['term']}")
+        elif 0 < p["after"] < p["before"]:
+            print(f"  protected {p['term']}: {p['before']} -> {p['after']} occurrences")
     if d["new_locked"]:
         print("  NEW in rewrite (verify each is supported by the source or the user):")
         for x in d["new_locked"]:
@@ -884,12 +1178,21 @@ def main(argv):
         genre = argv[argv.index("--genre") + 1]
     if "--top" in argv:
         top = int(argv[argv.index("--top") + 1])
-    args = [a for a in argv[2:] if not a.startswith("--") and a not in (genre, str(top))]
+    protect = None
+    if "--protect" in argv:
+        protect = parse_terms(argv[argv.index("--protect") + 1])
+    valued = {"--genre", "--top", "--protect", "--prefs", "--words", "--pages", "--sentences"}
+    args = [a for i, a in enumerate(argv[2:], 2) if not a.startswith("--") and argv[i - 1] not in valued]
+    paths = [] if "--no-prefs" in argv else list(PREF_PATHS)
+    if "--prefs" in argv:
+        paths.append(argv[argv.index("--prefs") + 1])
+    prefs = load_prefs(paths) if paths else None
+    limits = {k: parse_range(argv[argv.index("--" + k) + 1]) for k in ("words", "pages", "sentences") if "--" + k in argv} or None
     if cmd == "scan":
-        r = scan(read(args[0]), genre=genre, top=top)
+        r = scan(read(args[0]), genre=genre, top=top, prefs=prefs, limits=limits)
         print(json.dumps(r, indent=1)) if as_json else print_scan(r)
     elif cmd == "diff":
-        d = diff(read(args[0]), read(args[1]), genre=genre)
+        d = diff(read(args[0]), read(args[1]), genre=genre, protect=protect, prefs=prefs, limits=limits)
         print(json.dumps(d, indent=1)) if as_json else print_diff(d)
     elif cmd == "outline":
         o = outline(read(args[0]))
