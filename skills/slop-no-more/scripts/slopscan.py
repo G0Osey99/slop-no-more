@@ -14,11 +14,13 @@ Usage:
   and apply preferences.md (this skill's folder, then ~/.claude/slop-no-more/preferences.md):
       --prefs FILE adds one more file on top; --no-prefs ignores the defaults
   slopscan.py outline FILE          # first and last sentence of every paragraph (outline test, endings)
+  slopscan.py overlap PAPER SOURCE [SOURCE ...] [--min 8]   # wording shared with readings, quotes excluded
+  slopscan.py profile SAMPLE DRAFT  # how the draft differs from a sample of the author's own writing
 
 Genre aliases: essay = general, email = professional, post = casual. Each genre has its own human
 bands and its own set of scored checks (data/human_bands.json; INFO_IN below).
 
-FILE may be "-" for stdin. Plain text or Markdown. Blank lines separate paragraphs;
+FILE may be "-" for stdin. Plain text, Markdown, or .docx (body text only; convert PDFs to text first). Blank lines separate paragraphs;
 a block whose lines each end a sentence (Word exports) is read one paragraph per line.
 """
 import json
@@ -765,7 +767,7 @@ def load_prefs(paths=None):
     """Front matter of each preferences file that exists, later files overriding earlier ones.
     Keys: ban (comma list from BANNABLE), max_sentence_words, words_per_page. The text below the front matter
     is guidance for the writer and is not read here."""
-    prefs = dict(ban=set(), max_sentence_words=None, words_per_page=WORDS_PER_PAGE, sources=[])
+    prefs = dict(ban=set(), max_sentence_words=None, words_per_page=WORDS_PER_PAGE, contractions=None, sources=[])
     for path in PREF_PATHS if paths is None else paths:
         try:
             with open(path, encoding="utf-8") as fh:
@@ -789,6 +791,8 @@ def load_prefs(paths=None):
                 prefs["ban"] = {k for b in bad for k in BANNABLE if b.startswith(k[:5])}
             elif key in ("max_sentence_words", "words_per_page") and val.isdigit():
                 prefs[key] = int(val)
+            elif key == "contractions" and val.lower() in ("yes", "no"):
+                prefs["contractions"] = val.lower()
         if found:
             prefs["sources"].append(os.path.normpath(path))
     return prefs
@@ -841,6 +845,10 @@ def check_prefs(text, prefs):
                 a, b = max(0, h.start() - 50), min(len(t), h.end() + 40)
                 ex.append(("..." if a else "") + t[a:b].replace("\n", " ").strip() + ("..." if b < len(t) else ""))
             out[rule] = dict(count=len(hits), examples=ex)
+    if prefs.get("contractions") == "no":
+        hits = list(CONTRACTION.finditer(masked))
+        if hits:
+            out["contractions"] = dict(count=len(hits), examples=[t[max(0, h.start() - 40):h.end() + 30].replace("\n", " ").strip() for h in hits[:6]])
     cap = prefs.get("max_sentence_words")
     if cap:
         longs = [x for p in prose_paragraphs(strip_markup(t)) for x in sentences(p) if len(words_of(x)) > cap]
@@ -1043,6 +1051,133 @@ def diff(orig, new, genre="auto", protect=None, prefs=None, limits=None):
     )
 
 
+
+# ---------------------------------------------------------------- overlap with sources
+
+def overlap(paper, sources, n=RUN_MIN):
+    """Runs of n+ words the paper shares with each source, quotations in either text excluded.
+    sources: list of (name, text). Returns per-source runs and the share of the paper's words they cover."""
+    def toks(t):
+        t = normalize(t)
+        t = re.sub(r'"[^"\n]{3,600}"', " ‖ ", t)
+        t = re.sub(r"(?m)^\s*>.*$", " ‖ ", t)
+        return [None if m.group(0) == "‖" else m.group(0).lower()
+                for m in re.finditer(r"‖|[A-Za-z0-9À-ɏ]+(?:['’-][A-Za-z0-9]+)*", t)]
+    b = toks(paper)
+    covered = set()
+    out = []
+    for name, text in sources:
+        runs = verbatim_runs(text, paper, n)
+        a = toks(text)
+        grams = {tuple(a[i:i + n]) for i in range(len(a) - n + 1) if None not in a[i:i + n]}
+        for i in range(len(b) - n + 1):
+            if None not in b[i:i + n] and tuple(b[i:i + n]) in grams:
+                covered.update(range(i, i + n))
+        out.append(dict(source=name, count=len(runs), words=sum(len(r.split()) for r in runs), runs=runs))
+    nwords = len([w for w in b if w])
+    return dict(min_words=n, paper_words=nwords, covered_words=len(covered),
+                covered_pct=round(100.0 * len(covered) / max(1, nwords), 1), sources=out)
+
+
+def print_overlap(o):
+    print(f"OVERLAP  runs of {o['min_words']}+ words shared with the sources, quotations excluded")
+    print(f"  {o['covered_words']} of the paper's {o['paper_words']} words outside quotations ({o['covered_pct']}%) sit inside a shared run")
+    for src in o["sources"]:
+        print(f"\n  {src['source']}: {src['count']} run{'s' if src['count'] != 1 else ''}, {src['words']} words")
+        for r in src["runs"][:12]:
+            print(f"    = {snippet(r, 150)}  [{len(r.split())}]")
+        if src["count"] > 12:
+            print(f"    ... {src['count'] - 12} more (--json for all)")
+    if any(src["count"] for src in o["sources"]):
+        print("\n  Each run is the source's wording without quotation marks. Put it in quotes with a citation, or say it in your own words.")
+
+
+# ---------------------------------------------------------------- voice profile
+
+LONG_WORD = re.compile(r"\b[A-Za-z]{10,}\b")
+FIRST_PERSON = re.compile(r"\b(?:I|me|my|mine|myself|I'm|I've|I'd|I'll)\b")
+
+
+def voice_profile(text):
+    """Measures of how someone writes, for comparing a writing sample with a draft."""
+    t = normalize(text)
+    prose = strip_markup(t)
+    words = words_of(prose)
+    nw = max(len(words), 1)
+    k = 1000.0 / nw
+    paras = prose_paragraphs(prose) or [prose]
+    slen = [len(words_of(x)) for p in paras for x in sentences(p)] or [0]
+    masked = _mask_allowed(prose)
+    srt = sorted(slen)
+    pct = lambda q: srt[min(len(srt) - 1, int(q * len(srt)))]
+    return dict(
+        words=len(words), sentences=len(slen),
+        sent_mean=round(statistics.mean(slen), 1), sent_p10=pct(0.10), sent_p90=pct(0.90), sent_max=max(slen),
+        short8=round(sum(x <= 8 for x in slen) / len(slen), 2), long30=round(sum(x >= 30 for x in slen) / len(slen), 2),
+        para_mean=round(statistics.mean(len(words_of(p)) for p in paras), 1),
+        contractions_k=round(len(CONTRACTION.findall(prose)) * k, 1),
+        first_person_k=round(len(FIRST_PERSON.findall(prose)) * k, 1),
+        long_words_pct=round(100.0 * len(LONG_WORD.findall(prose)) / nw, 1),
+        word_len=round(statistics.mean(len(w) for w in words), 2) if words else 0,
+        nominal_100=round(len(NOMINAL.findall(prose.lower())) * 100.0 / nw, 1),
+        semicolon_k=round(len(re.findall(BAN_PATTERNS["semicolon"], masked)) * k, 1),
+        dash_k=round(len(re.findall(BAN_PATTERNS["dash"], masked)) * k, 1),
+        colon_k=round(len(re.findall(BAN_PATTERNS["colon"], masked)) * k, 1),
+        paren_k=round(len(re.findall(r"\(", masked)) * k, 1),
+        question_k=round(prose.count("?") * k, 1),
+    )
+
+
+# metric: (label, absolute floor for a gap to count, hint when the draft is higher, hint when lower)
+PROFILE_METRICS = {
+    "sent_mean": ("average sentence length (words)", 3.0, "shorter sentences on average", "longer sentences on average"),
+    "sent_p10": ("short end of sentence length (10th pct)", 2.0, "a few shorter sentences", "fewer very short sentences"),
+    "sent_p90": ("long end of sentence length (90th pct)", 4.0, "fewer long sentences", "a few longer sentences"),
+    "para_mean": ("average paragraph length (words)", 25.0, "shorter paragraphs", "longer paragraphs"),
+    "contractions_k": ("contractions per 1,000 words", 4.0, "fewer contractions", "more contractions"),
+    "first_person_k": ("I / me / my per 1,000 words", 8.0, "less first person", "more first person"),
+    "long_words_pct": ("long words (10+ letters), % of words", 1.5, "plainer, shorter words", "fewer plain words, more precise terms"),
+    "nominal_100": ("-tion/-ment/-ness nouns per 100 words", 1.0, "verbs instead of -tion nouns", "more noun phrases"),
+    "semicolon_k": ("semicolons per 1,000 words", 1.5, "fewer semicolons", "a semicolon where you'd use one"),
+    "dash_k": ("dashes per 1,000 words", 1.5, "fewer dashes", "a dash where you'd use one"),
+    "colon_k": ("colons per 1,000 words", 1.5, "fewer colons", "a colon where you'd use one"),
+    "paren_k": ("parentheses per 1,000 words", 1.5, "fewer parentheses", "a parenthetical where you'd use one"),
+    "question_k": ("questions per 1,000 words", 2.0, "fewer questions", "a question where you'd ask one"),
+}
+
+
+def compare_profiles(sample, draft):
+    """Gaps where the draft sits well outside the sample: |d - s| > max(35% of s, the metric's floor)."""
+    ps, pd = voice_profile(sample), voice_profile(draft)
+    gaps = []
+    for key, (label, floor, hi, lo) in PROFILE_METRICS.items():
+        sv, dv = ps[key], pd[key]
+        tol = max(0.35 * abs(sv), floor)
+        if abs(dv - sv) > tol:
+            gaps.append(dict(metric=key, label=label, sample=sv, draft=dv, score=round(abs(dv - sv) / tol, 2),
+                             hint=hi if dv > sv else lo))
+    gaps.sort(key=lambda g: -g["score"])
+    return dict(sample=ps, draft=pd, gaps=gaps, sample_too_short=ps["words"] < 300)
+
+
+def print_profile(c):
+    s, d = c["sample"], c["draft"]
+    print(f"VOICE PROFILE  sample {s['words']} words / draft {d['words']} words")
+    if c["sample_too_short"]:
+        print("  ! the sample is under 300 words: treat every gap below as a rough hint")
+    print(f"  {'':42s} {'sample':>8s} {'draft':>8s}")
+    for key, (label, *_rest) in PROFILE_METRICS.items():
+        mark = "!" if any(g["metric"] == key for g in c["gaps"]) else " "
+        print(f"  {mark} {label:40s} {s[key]:>8g} {d[key]:>8g}")
+    if c["gaps"]:
+        print("\n  Biggest gaps (the draft vs how you write), largest first:")
+        for g in c["gaps"][:6]:
+            print(f"    - {g['label']}: {g['draft']:g} vs your {g['sample']:g}. Aim for {g['hint']}.")
+        print("  These are habits to lean toward, not quotas. Preferences and the assignment come first.")
+    else:
+        print("\n  No large gaps: the draft sits within your range on every measure.")
+
+
 # ---------------------------------------------------------------- output
 
 def print_prefs_limits(pr, lim, label="TEXT"):
@@ -1163,8 +1298,33 @@ def print_outline(rows):
 def read(path):
     if path == "-":
         return sys.stdin.read()
+    if path.lower().endswith(".docx"):
+        return read_docx(path)
     with open(path, encoding="utf-8") as fh:
         return fh.read()
+
+
+def read_docx(path):
+    """Plain text of a Word file's body, one paragraph per line, blank line between paragraphs (stdlib only)."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    paras = []
+    for para in root.iter(W + "p"):
+        bits = []
+        for node in para.iter():
+            if node.tag == W + "t" and node.text:
+                bits.append(node.text)
+            elif node.tag == W + "tab":
+                bits.append("\t")
+            elif node.tag in (W + "br", W + "cr"):
+                bits.append("\n")
+        text = "".join(bits).strip()
+        if text:
+            paras.append(text)
+    return "\n\n".join(paras)
 
 
 def main(argv):
@@ -1181,7 +1341,7 @@ def main(argv):
     protect = None
     if "--protect" in argv:
         protect = parse_terms(argv[argv.index("--protect") + 1])
-    valued = {"--genre", "--top", "--protect", "--prefs", "--words", "--pages", "--sentences"}
+    valued = {"--genre", "--top", "--protect", "--prefs", "--words", "--pages", "--sentences", "--min"}
     args = [a for i, a in enumerate(argv[2:], 2) if not a.startswith("--") and argv[i - 1] not in valued]
     paths = [] if "--no-prefs" in argv else list(PREF_PATHS)
     if "--prefs" in argv:
@@ -1194,6 +1354,14 @@ def main(argv):
     elif cmd == "diff":
         d = diff(read(args[0]), read(args[1]), genre=genre, protect=protect, prefs=prefs, limits=limits)
         print(json.dumps(d, indent=1)) if as_json else print_diff(d)
+    elif cmd == "overlap":
+        n = int(argv[argv.index("--min") + 1]) if "--min" in argv else RUN_MIN
+        srcs = [a for a in args[1:] if a != str(n)]
+        o = overlap(read(args[0]), [(os.path.basename(x), read(x)) for x in srcs], n)
+        print(json.dumps(o, indent=1)) if as_json else print_overlap(o)
+    elif cmd == "profile":
+        c = compare_profiles(read(args[0]), read(args[1]))
+        print(json.dumps(c, indent=1)) if as_json else print_profile(c)
     elif cmd == "outline":
         o = outline(read(args[0]))
         print(json.dumps(o, indent=1)) if as_json else print_outline(o)

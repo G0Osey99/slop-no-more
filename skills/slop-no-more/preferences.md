@@ -1,6 +1,7 @@
 ---
 ban:                  # any of: semicolon, dash, colon, parenthesis, exclamation (comma-separated)
 max_sentence_words:   # a number, or leave blank for no cap
+contractions:         # yes, no, or blank to follow the genre
 words_per_page:       # for --pages estimates; blank means 275 (12 pt, double-spaced)
 ---
 

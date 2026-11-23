@@ -302,6 +302,50 @@ class PrefsAndLimitsTests(unittest.TestCase):
         self.assertIsNone(S.scan(PLAIN)["prefs"])
 
 
+class OverlapProfileDocxTests(unittest.TestCase):
+    SRC = ("Hedging lets writers present claims with appropriate caution and invite readers to weigh the evidence. "
+           "Much of the research on hedging attempts to define it theoretically and functionally across disciplines.")
+
+    def test_overlap_finds_unquoted_runs_only(self):
+        paper = ('I think hedging matters. Much of the research on hedging attempts to define it theoretically, '
+                 'and as one writer says, "Hedging lets writers present claims with appropriate caution and invite readers to weigh the evidence."')
+        o = S.overlap(paper, [("reading.txt", self.SRC)])
+        self.assertEqual(o["sources"][0]["runs"], ["Much of the research on hedging attempts to define it theoretically and"])
+        self.assertGreater(o["covered_pct"], 0)
+        self.assertEqual(S.overlap("Nothing here comes from the reading at all, not one phrase.", [("r", self.SRC)])["covered_words"], 0)
+
+    def test_overlap_min_words(self):
+        paper = "Writers present claims with appropriate caution here."
+        self.assertEqual(S.overlap(paper, [("r", self.SRC)])["sources"][0]["count"], 0)
+        self.assertEqual(S.overlap(paper, [("r", self.SRC)], n=5)["sources"][0]["count"], 1)
+
+    def test_profile_gaps(self):
+        sample = ("I don't love long sentences. I'm short and plain. It's how I talk, and I'd rather keep it that way. " * 16)
+        draft = ("The implementation of the comprehensive organizational methodology necessitates considerable deliberation regarding "
+                 "institutional responsibilities and the establishment of collaborative frameworks across departments. " * 6)
+        c = S.compare_profiles(sample, draft)
+        keys = {g["metric"] for g in c["gaps"]}
+        self.assertTrue({"sent_mean", "contractions_k", "long_words_pct", "nominal_100"} <= keys, keys)
+        self.assertEqual(S.compare_profiles(sample, sample)["gaps"], [])
+        self.assertFalse(c["sample_too_short"])
+
+    def test_contractions_preference(self):
+        v = S.check_prefs('I can\'t go. She said "don\'t" twice. It is fine.', dict(ban=set(), contractions="no"))
+        self.assertEqual(v["contractions"]["count"], 1)
+        self.assertEqual(S.check_prefs("I can't go.", dict(ban=set(), contractions="yes")), {})
+
+    def test_read_docx(self):
+        import tempfile, zipfile
+        xml = ('<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+               '<w:p><w:r><w:t>First </w:t></w:r><w:r><w:t>paragraph.</w:t></w:r></w:p><w:p></w:p>'
+               '<w:p><w:r><w:t>Second</w:t><w:tab/><w:t>one.</w:t></w:r></w:p></w:body></w:document>')
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "x.docx")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("word/document.xml", xml)
+            self.assertEqual(S.read(path), "First paragraph.\n\nSecond\tone.")
+
+
 class SkillFileTests(unittest.TestCase):
     ROOT = os.path.join(HERE, "..")
 
